@@ -97,10 +97,14 @@ TypeMappers are ~223 hand-written Scala files, mostly ids.
 ### 4.1 TypeMapper → `rustpb::TypeMapper`
 
 ```rust
-pub trait TypeMapper<Base: Default> {
+pub trait TypeMapper<Base> {
     type Custom;
     fn to_custom(base: Base) -> Result<Self::Custom, MapError>;
     fn to_base(custom: &Self::Custom) -> Base;
+}
+
+/// Only for mappers used in a singular position (§4.1, defaults).
+pub trait DefaultMapper<Base: Default>: TypeMapper<Base> {
     /// Must equal `to_custom(Base::default())`. Generated tests check it.
     fn default_custom() -> Self::Custom;
 }
@@ -137,38 +141,74 @@ pub trait TypeMapper<Base: Default> {
 - `key_type`, `value_type`: the same trait, applied to map keys and values.
 - In JSON, a mapped field prints its *base* value, as ScalaPB's does.
 
-#### Defaults and failures of mapped fields (review #1, finding 3)
+#### Mapped fields by kind: decoding, encoding, defaults (review #1, finding 3)
 
-ScalaPB's rules, read from its generator, and rustpb's twin of each:
+ScalaPB's rules depend on the field's *kind*, as its generator defines
+them (`DescriptorImplicits`): **singular** is `!supportsPresence &&
+!isRepeated && !isInOneof`, so it covers plain proto3 scalars, `no_box`
+and `required` message fields. **Presence** is proto3 `optional`, or a
+message field boxed in `Option`. Then come **oneof** members, and
+**repeated** fields and maps. rustpb copies each rule per kind:
 
-| Moment | ScalaPB (`ProtobufGenerator`, `ParseFromGenerator`) | rustpb |
+| Kind | Decoding (`ParseFromGenerator`) | Encoding (`ProtobufGenerator.generateWriteTo`) |
 |---|---|---|
-| Decoding | Reads the *base* value: the last occurrence wins for scalars, and occurrences merge for messages. Then calls `toCustom` **once**, after the whole message is read | The same: base first, `to_custom` once at the end |
-| Field absent | `toCustom(base default)`, e.g. `toCustom("")` or `toCustom(TimestampMessage.defaultInstance)` | `to_custom(Base::default())`, never the custom type's own `Default` |
-| Mapping fails | The exception escapes `parseFrom` | `DecodeError::Map { field, source }`; no panic, no substitute value |
-| Encoding | Writes the field only if `toBase(value)` differs from the base default | The same test, on `to_base(value)` |
-| Default instance / constructor default | `toCustom(base default)`, evaluated lazily, so a mapper that rejects it throws on first use | `default_custom()`: infallible, so `impl Default` never panics and never needs `Custom: Default` |
+| Singular | Reads the *base* value: the last occurrence wins for scalars, and occurrences merge for messages. Calls `to_custom` **once**, after the whole message is read (`usesBaseTypeInBuilder = isSingular`) | Written only if `to_base(v)` is non-empty: a scalar not equal to the base default, a message with a non-zero serialized size |
+| Singular, `required` | As singular; absent → `DecodeError` naming the field | **Always written**, even when the base is the default |
+| Presence (`Option<C>`) | Mapped **on each occurrence**: a scalar maps its new value; a message maps `to_custom(merge(to_base(current), next))`. A failure at any occurrence fails the decode, even if a later occurrence would have mapped | **Every `Some` is written**, `Some` of a base default included (`Some(0)`, `Some("")`) |
+| Oneof member | Mapped **on each occurrence**, as presence. A rejected value fails the decode even when a later occurrence selects another variant | The selected variant is **always written**, even when its base is empty |
+| Repeated, map key/value | Each element is mapped as it is read, from packed and unpacked chunks alike | **Every element is written**, empty ones included; packed elements via `to_base` |
 
-`default_custom()` is the only new obligation. For every mapper a crate
-uses, `rustpb-build` generates a `#[test]` asserting
-`M::to_custom(Base::default()) == Ok(M::default_custom())`. This is the
-one intentional departure from ScalaPB: **rustpb refuses a mapper that
-rejects its base default.** ScalaPB accepts such a mapper and fails at run
-time, the first time the message's default is touched. rustpb fails at
-`cargo test`, naming the mapper and the field. To port such a mapper, make
-it accept the base default.
+**Absent singular field:** `to_custom(Base::default())`, never the custom
+type's own `Default`. A failure gives `DecodeError::Map { field, source }`:
+no panic, no substitute value. Absent presence, oneof and repeated fields
+are `None`, unselected or empty: **the mapper is never called**, as in
+ScalaPB, so these fields put no condition on the mapper.
 
-Required fixtures:
+**`impl Default` asks only what ScalaPB's default instance asks.**
+ScalaPB's `defaultInstance` calls `toCustom(base default)` for singular
+mapped fields only. So:
 
-- A mapper whose mapped base default differs from the custom type's
-  `Default`. For example, an id whose `Default` is a sentinel, but
-  `to_custom("")` gives the registry's default id. An absent field must
-  decode to the latter.
-- A mapper that rejects the base default. The generated test must fail
-  with the field's name, and decoding a message with that field absent
-  must return `DecodeError::Map`.
-- A mapper that rejects one non-default value. Decoding must return
-  `DecodeError::Map`; encoding of every accepted value must round-trip.
+- A message with no singular mapped field gets `impl Default` with no
+  condition on any mapper. A mapper used only in optional, oneof or
+  repeated positions (for example, a non-empty-string id that rejects
+  `""`) needs nothing beyond `TypeMapper`, and its behaviour is unchanged.
+- For each singular mapped field, the generated `impl Default` calls
+  `<M as DefaultMapper<Base>>::default_custom()`. So `DefaultMapper` is
+  required of exactly the mappers ScalaPB would call for the default
+  instance, and it never panics. For each such mapper, `rustpb-build`
+  generates a `#[test]` asserting
+  `M::to_custom(Base::default()) == Ok(M::default_custom())`. Decoding still
+  calls `to_custom`, not `default_custom`, so decoding stays faithful
+  whatever the test says.
+- **A singular field whose mapper rejects its base default.** ScalaPB
+  accepts this, and throws the first time the default instance is touched.
+  rustpb does not ask the mapper to change. The message declares
+  `option (rustpb.message).default = false`, which gives no `impl Default`
+  and instead a `fn try_default() -> Result<Self, MapError>` that fails as
+  ScalaPB's default instance would. Decoding is unchanged: an absent field
+  returns `DecodeError::Map`, as ScalaPB's parser throws. A message has
+  either `impl Default` or `try_default()`, never both. If the option is
+  missing, the generated `impl Default` fails to compile, naming the mapper
+  that lacks `DefaultMapper`.
+
+Fixtures, each checked against ScalaPB:
+
+- A singular mapper whose mapped base default differs from the custom
+  type's `Default`. An absent field must decode to the former.
+- A mapper used only in repeated, optional and oneof positions that rejects
+  `""`. The message gets `impl Default`; empty containers decode; a `""`
+  element fails the decode.
+- A singular mapper that rejects its base default, with `default = false`.
+  `try_default()` fails; decoding with the field absent fails; decoding
+  with a valid value succeeds.
+- Oneof: a rejected mapped value followed by another variant. The decode
+  fails.
+- Optional message: an occurrence whose intermediate merge is rejected,
+  followed by one that would make it valid. The decode fails.
+- Encoding: `Some(0)` and `Some("")` on mapped presence fields, a selected
+  mapped oneof variant whose base is `""`, empty repeated elements, and a
+  `required` field holding the base default. All must be written, matching
+  ScalaPB's bytes.
 
 ### 4.2 Messages, fields, enums
 
@@ -332,7 +372,7 @@ printer settings. It does **not** follow canonical ProtoJSON on reading:
 | Proto field name `my_field` | **Skipped silently**: only the `json_name` is indexed | Accepted as an alias | **Skipped, as 0.1.2 does** |
 | Unknown key | Skipped | Error by default | Skipped |
 | `"field": null` | Treated as absent (default) | Treated as absent | Treated as absent |
-| Same key twice | The last one wins, a repeated field's array included | Error | The last one wins |
+| Same key twice | The last **non-null** one wins, a repeated field's array included. A later `null` is skipped, so the earlier value stays | Error | The same, `null` rule included |
 | Two members of one oneof | Both reach the reader; the result is fixture-defined | Error | Whatever the fixture records 0.1.2 doing |
 
 Matching 0.1.2 exactly is the decision: a JSON value must decode the same
@@ -343,7 +383,8 @@ question 7, not fixed quietly in rustpb.
 
 Parser fixtures, each checked against 0.1.2 with its expected value or
 error: the proto-name alias, an unknown key, `null` for each kind of field,
-a duplicate scalar key, a duplicate repeated key, two oneof members, a
+a duplicate scalar key, a duplicate repeated key, a duplicate key whose
+last value is `null` (the earlier value stays), two oneof members, a
 standalone enum as `{"value": n}` / `"NAME"` / `n` / an unknown name, and
 int64 given as a number versus a string.
 
