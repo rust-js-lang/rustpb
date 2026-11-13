@@ -103,9 +103,9 @@ pub trait TypeMapper<Base> {
     fn to_base(custom: &Self::Custom) -> Base;
 }
 
-/// Only for mappers used in a singular position (§4.1, defaults).
-pub trait DefaultMapper<Base: Default>: TypeMapper<Base> {
-    /// Must equal `to_custom(Base::default())`. Generated tests check it.
+/// Only for mappers of singular fields in defaultable messages (§4.1, defaults).
+pub trait DefaultMapper<Base>: TypeMapper<Base> {
+    /// Must equal `to_custom(base default)`. Generated tests check it.
     fn default_custom() -> Self::Custom;
 }
 ```
@@ -158,7 +158,7 @@ message field boxed in `Option`. Then come **oneof** members, and
 | Oneof member | Mapped **on each occurrence**, as presence. A rejected value fails the decode even when a later occurrence selects another variant | The selected variant is **always written**, even when its base is empty |
 | Repeated, map key/value | Each element is mapped as it is read, from packed and unpacked chunks alike | **Every element is written**, empty ones included; packed elements via `to_base` |
 
-**Absent singular field:** `to_custom(Base::default())`, never the custom
+**Absent singular field:** `to_custom(base default)` (a scalar default, or `Base::try_default()?` for a message base), never the custom
 type's own `Default`. A failure gives `DecodeError::Map { field, source }`:
 no panic, no substitute value. Absent presence, oneof and repeated fields
 are `None`, unselected or empty: **the mapper is never called**, as in
@@ -168,28 +168,125 @@ ScalaPB, so these fields put no condition on the mapper.
 ScalaPB's `defaultInstance` calls `toCustom(base default)` for singular
 mapped fields only. So:
 
-- A message with no singular mapped field gets `impl Default` with no
-  condition on any mapper. A mapper used only in optional, oneof or
-  repeated positions (for example, a non-empty-string id that rejects
-  `""`) needs nothing beyond `TypeMapper`, and its behaviour is unchanged.
+- A message with no singular mapped field, and no singular child that is
+  non-defaultable (see "Default construction composes" below), gets
+  `impl Default` with no condition on any mapper. A mapper used only in
+  optional, oneof or repeated positions (for example, a non-empty-string id
+  that rejects `""`) needs nothing beyond `TypeMapper`, and its behaviour is
+  unchanged.
 - For each singular mapped field, the generated `impl Default` calls
   `<M as DefaultMapper<Base>>::default_custom()`. So `DefaultMapper` is
   required of exactly the mappers ScalaPB would call for the default
   instance, and it never panics. For each such mapper, `rustpb-build`
   generates a `#[test]` asserting
-  `M::to_custom(Base::default()) == Ok(M::default_custom())`. Decoding still
+  `M::to_custom(base default) == Ok(M::default_custom())`. Decoding still
   calls `to_custom`, not `default_custom`, so decoding stays faithful
   whatever the test says.
 - **A singular field whose mapper rejects its base default.** ScalaPB
   accepts this, and throws the first time the default instance is touched.
   rustpb does not ask the mapper to change. The message declares
-  `option (rustpb.message).default = false`, which gives no `impl Default`
-  and instead a `fn try_default() -> Result<Self, MapError>` that fails as
-  ScalaPB's default instance would. Decoding is unchanged: an absent field
-  returns `DecodeError::Map`, as ScalaPB's parser throws. A message has
-  either `impl Default` or `try_default()`, never both. If the option is
-  missing, the generated `impl Default` fails to compile, naming the mapper
-  that lacks `DefaultMapper`.
+  `option (rustpb.message).default = false`. If that option is missing,
+  the generated `impl Default` fails to compile, naming the mapper that
+  lacks `DefaultMapper`.
+
+#### Default construction composes through the message graph
+
+ScalaPB's `defaultInstance` is built from the defaults of the message's
+singular fields. A `no_box` or `required` child's default is the child's
+`defaultInstance`, and a mapped field's is `toCustom(base default)`, where a
+message base's default is *its* `defaultInstance`. So one failing default
+fails every message that reaches it through singular fields (review #1,
+follow-up). rustpb copies that graph exactly:
+
+1. **Every generated message implements
+   `rustpb::Message::try_default() -> Result<Self, DefaultError>`**, the
+   twin of `defaultInstance`. It builds each singular field:
+   - a scalar: its proto default;
+   - an unmapped `no_box`/`required` message: `Child::try_default()?`;
+   - a mapped field: `M::to_custom(base_default?)`, where `base_default` is
+     the scalar default or `Base::try_default()?`;
+   - optional, oneof and repeated fields: `None`, unset and empty, with no
+     call.
+
+   `DefaultError` names the path that failed, such as
+   `Parent.child.owner_id`, and keeps the mapper's `MapError`.
+2. **Defaultability is computed by `rustpb-build`** over the whole
+   descriptor set, imports included, as a fixed point. A message is
+   **non-defaultable** if it declares `default = false`, or if any singular
+   field's default needs a non-defaultable message: an unmapped
+   `no_box`/`required` child, or a mapped field whose base message is
+   non-defaultable. Only the root cause declares the option. Parents
+   inherit the property, and their generated docs say why, naming the chain.
+   **Cycles:** a cycle made only of singular default edges (an unmapped
+   `no_box`/`required` child, or a mapped field's base message), such as
+   `A.b: no_box B` with `B.a: no_box A`, has no finite default even with no
+   `default = false` in it. `rustpb-build` detects it and refuses, with an
+   "unsupported default-construction cycle" error that names the cycle,
+   instead of generating a recursive `Default` that overflows the stack. An
+   optional, oneof or repeated edge breaks the cycle, because its default
+   is `None` or empty and needs no call.
+3. **`impl Default` exists exactly for defaultable messages.** It is
+   infallible: scalars, `Child::default()`, and `default_custom()`. A
+   generated test asserts `M::try_default() == Ok(M::default())` for each.
+   A non-defaultable message has no `impl Default`; its default
+   construction is only `try_default()`, which fails as ScalaPB's would.
+   `DefaultMapper` is required only for singular mapped fields of
+   *defaultable* messages. A mapped field whose base is non-defaultable
+   makes its message non-defaultable, so `default_custom` is never asked
+   of it.
+4. **Decoding never uses `Default` or `try_default` to start.** The
+   generated decoder holds each singular field in a builder slot, the base
+   value as `Option<Base>` (absent is `None`), and each repeated field as a
+   growing `Vec`. Nested timing is ScalaPB's (`ParseFromGenerator`): each
+   occurrence of a message field is **decoded completely when it is read**,
+   with its own end-of-message checks. A later occurrence merges into the
+   already-decoded value. Undecoded bytes are never collected across
+   occurrences to check later. At the end of the message, in this order:
+   (a) every `required` field must be present, or `DecodeError` names it,
+   because ScalaPB checks its required bitmask before building the message;
+   (b) only then does an absent ordinary singular slot become its default
+   by the rule in 1; (c) singular mapped slots call `to_custom` (§4.1).
+   So:
+   - a populated `Parent` whose `child` is present decodes, even though
+     `Child` is non-defaultable;
+   - an absent `child` or `owner_id` fails with `DecodeError::Default`
+     naming the path, as ScalaPB's parser throws;
+   - an `Option<Child>` that is absent is `None`, with no call. A present
+     but empty `Child`, in an optional, oneof or repeated position, fails,
+     because decoding that `Child` hits its own absent singular field. That
+     too is what ScalaPB does.
+5. **The prost boundary.** prost's `Message::decode` and
+   `message::merge_repeated` require `M: Default`, and so does its map-entry
+   merge. `message::merge` and `message::encode` require only
+   `M: Message`, but they are built around prost's `Message` trait. rustpb
+   therefore owns its own `Message` trait, message merge, map-entry decode
+   and the builder above. It reuses only prost's scalar wire primitives:
+   `encode_varint`/`decode_varint`, `encode_key`/`decode_key`, `WireType`,
+   length delimiters, `skip_field`, and the scalar and string/bytes
+   codecs that merge into an existing value.
+
+Fixtures for the graph, each checked against ScalaPB:
+
+- `Child`: a singular mapped `string` that rejects `""`, with
+  `default = false`. `Parent`: an unmapped `no_box Child`, with no option of
+  its own. `Parent` must have no `impl Default`, and `Parent::try_default()`
+  must fail, naming `Parent.child.<field>`. A populated `Parent` must decode
+  and round-trip. A `Parent` with `child` absent must fail.
+- A `required` child, and a mapped field whose *base message* is
+  non-defaultable. Both propagate the same way.
+- `Option<Child>`, `Vec<Child>` and a oneof `Child`: absent or empty
+  containers decode; a present empty `Child` fails; populated elements
+  decode.
+- A singular-only cycle (`A.b: no_box B`, `B.a: no_box A`): `rustpb-build`
+  refuses it, naming the cycle. The same cycle through an optional edge
+  generates and decodes.
+- A `required` field absent alongside an absent non-defaultable singular
+  child: the required error is reported, since it is checked first.
+- A singular message field twice, where the first occurrence alone fails
+  its own decode: the decode fails at the first occurrence, as ScalaPB's
+  does.
+- Three levels deep (`Grandparent → Parent → Child`): the error path names
+  all three.
 
 Fixtures, each checked against ScalaPB:
 
@@ -216,7 +313,7 @@ Fixtures, each checked against ScalaPB:
 |---|---|
 | `case class M(..)` | `pub struct M { pub .. }`, `Default`, `Clone`, `PartialEq`, `Debug` |
 | message field `Option[T]` | `Option<T>`; `Option<Box<T>>` only where the type is recursive (rustc requires it) |
-| `no_box` | `T`. Missing on the wire → `T::default()`, or for a mapped field `to_custom(Base::default())` (§4.1) |
+| `no_box` | `T`. Missing on the wire → `T::try_default()?`, or for a mapped field `to_custom(base default)` (§4.1, defaults compose) |
 | `required` | `T`; decode fails with `DecodeError` naming the field when absent |
 | `repeated` → `Seq` | `Vec<T>` |
 | `collection_type = "Set"` | `BTreeSet<T>` (deterministic bytes; open question 3) |
