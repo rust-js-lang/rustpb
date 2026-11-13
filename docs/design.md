@@ -57,7 +57,7 @@ TypeMappers are ~223 hand-written Scala files, mostly ids.
 ```
  rustpb/                      (this repo, plain native Rust; no rust-js dependency)
  ├── rustpb            runtime: Message, TypeMapper, UnknownFields, DecodeError,
- │                     wire primitives (re-used from prost::encoding)
+ │                     rustpb::wire (pinned prost arithmetic, §3 dec. 1)
  ├── rustpb-derive     #[derive(rustpb::Message)]: encode/decode/size/merge, Default
  ├── rustpb-build      .proto → Rust source, called from build.rs
  ├── rustpb-json       proto3 JSON (serde impls), matching the Scala app's printer
@@ -70,16 +70,26 @@ TypeMappers are ~223 hand-written Scala files, mostly ids.
 
 ### Decisions and why
 
-1. **Wire primitives from prost, not re-written.** Varints, zigzag, length
-   prefixes and skipping unknown fields are exactly where subtle bugs hide.
-   `prost::encoding` is proven. rustpb adds what prost lacks; it never
-   re-implements the wire format.
+1. **Wire arithmetic from prost, behind one `rustpb::wire` module.**
+   Varints, zigzag and fixed-width codecs are where subtle bugs hide, and
+   prost's are fuzzed and Kani-checked. But only the *arithmetic* is proven.
+   `prost::encoding` is `#[doc(hidden)]` and not a stable API (prost #903);
+   prost is passively maintained; its string merge uses `unsafe`; and its
+   *policies* differ from ScalaPB's (§4.6). So:
+   - every call to prost goes through `rustpb::wire`, which pins prost
+     exactly;
+   - rustpb takes no policy from prost: packedness, wire-type mismatch,
+     oneof placement, map checks and unknown fields are all rustpb's own;
+   - strings are decoded by rustpb's safe code.
+
+   Replacing the arithmetic later is then a change to one module.
 
 2. **Our own derive, not prost's.** prost-derive's field kinds are a closed
    list (`scalar`, `string`, `bytes`, `message`, `enumeration`, `map`,
    `oneof`, `group`): no custom types, no sealed oneofs, no unknown fields.
-   7,785 typed fields cannot go through it. `rustpb-derive` writes the same
-   kind of code, calling `prost::encoding`, and adds those three features.
+   7,785 typed fields cannot go through it. `rustpb-derive` generates its
+   own encode, decode and size code, calling `rustpb::wire` for the
+   arithmetic, with ScalaPB's policies (§4.6).
 
 3. **build.rs, with a pure-Rust parser (`protox`).** It is the Rust
    convention (prost-build, tonic-build). It needs no `protoc` binary on any
@@ -87,10 +97,33 @@ TypeMappers are ~223 hand-written Scala files, mostly ids.
    Generated code is not committed. ScalaPB's protoc-plugin form is not
    offered as a second way.
 
-4. **Fields are written in field-number order, as both ScalaPB and prost
-   do** (`ProtobufGenerator.scala:676`, `prost-derive/src/lib.rs:91`).
-   So for messages without sets, maps or unknown fields, the output is
-   byte-identical to ScalaPB's, which makes the proof in §6 simple.
+4. **Fields are written in field-number order, as ScalaPB does**
+   (`ProtobufGenerator.scala:676`, `message.fields.sortBy(_.getNumber)`).
+   That includes **oneof members, each written at its own field number**
+   among the other fields. prost-derive instead places a whole oneof at its
+   lowest tag (its own `lib.rs` TODO), which reorders bytes, so rustpb does
+   not copy it. For messages without sets, maps or unknown fields, the
+   output is byte-identical to ScalaPB's, which makes the proof in §6 simple.
+
+5. **The runtime has no `unsafe`, no FFI, no link-time registries, no
+   atomics and no self-referential types.** These are the patterns that
+   don't lower to JavaScript, and where the ecosystem's soundness bugs
+   cluster (quick-protobuf #269–#274). femtopb shows a full codec needs none
+   of them. Size computation keeps no cached size inside the struct (§4.6).
+
+6. **Descriptors are read through a model that keeps custom options.**
+   prost-types drops extension values (pilota #372 shows the same failure),
+   which would silently lose every `(rustpb.*)` option. rustpb-build uses
+   protox with prost-reflect's descriptor pool, which keeps extensions. A
+   CI check compares protox's and protoc's descriptors (`json_name`,
+   options, packed) for every schema file.
+
+7. **Code generation never panics.** A name collision becomes a diagnostic
+   naming both protos. Examples: a oneof vs a nested type; an enum variant
+   named `Error`; the generated `Empty` or `Unrecognized` variant vs a
+   proto value of that name; keywords like `gen` and `self`. Generated code
+   writes `::core::option::Option`, because a proto message named `Option`
+   would shadow the prelude. prost panics on several of these.
 
 ## 4. Mapping every ScalaPB feature
 
@@ -418,6 +451,47 @@ from what Scala reads.
   gone**, by `rustpb-migrate drop-scalapb`. rustpb itself never reads
   `(scalapb.*)` options: only the migration tool knows ScalaPB.
 
+### 4.6 Wire policies, and limits
+
+The Rust ecosystem's worst bugs were not in new features. They were small
+policies copied by default, and missing limits. See the prior-art report,
+`reports/Rust protobuf ecosystem prior art.md`. Each rule below is rustpb's
+own, read from ScalaPB's source where ScalaPB decides it, and pinned by a
+fixture.
+
+**Binary policies:**
+
+| Policy | Rule (verified in ScalaPB) | Prior-art failure it avoids |
+|---|---|---|
+| Packedness | Computed from the raw `packed` option, with the proto3 default `true`, never from "has any options". Nearly every rustpb field carries `(rustpb.field)` options | prost wrote such fields unpacked until 0.14.5 (#976) |
+| A known field with the wrong wire type | **Treated as unknown**: ScalaPB matches the full tag `(number << 3) \| wire_type`, so a mismatch falls to `case tag =>` (`ParseFromGenerator.scala:215–222`). Packable repeated fields accept both packed and unpacked tags. This holds for map fields too | prost returns `UnexpectedWireType`; its maps skipped the check until 0.14.6 (#1473) |
+| Oneof placement | Each member at its own field number (§3 dec. 4) | prost-derive writes a oneof at its lowest tag |
+| `-0.0` and defaults | A singular `float`/`double` is omitted when `v != 0.0` is false under **IEEE** comparison (`ProtobufGenerator.isNonEmpty`), so **`-0.0` is omitted**, as ScalaPB does. NaN is written | prost #1177; buffa compares bits. rustpb follows ScalaPB, not either of them |
+| Unknown fields, kept | Stored per field number; within a number, values grouped by wire type and written **varint, fixed32, fixed64, length-delimited** (`UnknownFieldSet.Field.writeTo`), after the known fields. Across numbers, ScalaPB's order is a Scala hash map's, so rustpb writes ascending field numbers, and §6 compares unknown fields by value | rust-protobuf loses order too, undocumented |
+| Unknown **group** (wire type 3/4) | Message **preserves** unknown fields: decode fails, as ScalaPB's `UnknownFieldSet.Field.Builder.parseField` throws `InvalidProtocolBufferException`. Message **doesn't preserve**: skipped (with the depth budget below), as `skipField` does | RUSTSEC-2024-0437: skipping groups bypassed the recursion limit |
+| Size and write | One owner computes both; a generated assertion in debug builds and the first fuzz oracle check `encoded_len == bytes written`. A negative `int32` is 10 bytes, a packed `Unrecognized(-1)` too | rust-protobuf #766: size and write disagree for a negative unknown enum |
+| Size strategy | No cached size in the struct (§3 dec. 5). Encoding computes nested sizes once per message, into an external size buffer, giving linear time (buffa's approach) | prost recomputes nested sizes per level (#1112); rust-protobuf's in-struct atomic size can't lower to JS |
+| Equality | Generated `PartialEq` includes `unknown_fields`, compared by value per field number, as ScalaPB's case-class equality includes `unknownFields` | Google's crate omits `PartialEq` entirely |
+
+**Limits** (every advisory against a Rust protobuf crate is a denial of
+service):
+
+- **One depth budget**, default 100 as in C++, shared by nested-message
+  decode, map-entry decode, unknown-group skipping, JSON input nesting and
+  default construction. Exceeding it is a `DecodeError`, never a stack
+  overflow (RUSTSEC-2020-0002, RUSTSEC-2024-0437). Encoding checks the same
+  depth, so rustpb never writes a message it cannot read back (prost #736).
+- **Never reserve from a declared length.** A length prefix or packed byte
+  count is checked against the bytes remaining in its parent before any
+  read. Collections grow as elements actually arrive (RUSTSEC-2019-0003,
+  quick-protobuf #273).
+- **JSON input** is bounded the same way: depth, string and number sizes;
+  no `arbitrary_precision` (buffa #482).
+
+Fixtures: depth bombs through messages, maps and unknown groups; a huge
+declared length on a tiny input; a packed field whose byte count runs past
+its parent; and one fixture per advisory, also seeded into the fuzz corpus.
+
 ## 5. JSON
 
 The browser speaks JSON today. The Scala app's endpoints send proto models
@@ -456,6 +530,23 @@ How rustpb-json does it:
 - Golden tests pin every rule above against the Scala printer's output
   (§6). The pinned scalapb-jsoniter version matters: if the Scala side
   upgrades, the goldens are re-made and compared.
+- **rustpb owns its number and time formatting.** It writes floats,
+  doubles, `Timestamp` and `Duration` with its own writers, matched
+  digit-for-digit to scalapb-jsoniter. It never uses serde_json's float
+  path, which writes NaN as `null` (pbjson #106) and changed digits when it
+  moved from ryu to zmij. It never uses a time crate's RFC 3339 output, which
+  gives `+00:00` where ProtoJSON wants `Z` (pbjson's own test asserts the
+  wrong form). Negative `Duration`s with zero seconds keep their sign: two
+  Rust crates lose it.
+- **A mapped field's JSON goes only through `to_base` and the base type's
+  writer, in every position.** A custom type never needs `Serialize`, so
+  foreign types such as time types work unchanged.
+- **Enum names come from a generated table** holding every value and every
+  alias, separate from the Rust variant names (open question 4). pbjson
+  can't parse aliases (#123).
+- **Options are fixed at build time, never ambient.** buffa passes its runtime
+  parse options through a thread-local, which wouldn't carry over to the JS
+  output.
 
 #### The reference parser's contract (review #1, finding 4)
 
@@ -525,17 +616,44 @@ int64 given as a number versus a string.
    | Sealed oneof empty in each position | `Empty` / `None` (§4.3) |
    | A `required` field absent | `DecodeError` naming the field |
    | A map entry with key or value missing | The default is used for the missing part |
-   | Unknown fields of each wire type, preserved and not | Kept in order, or dropped |
+   | Unknown fields of each wire type, preserved and not | Kept, re-written grouped per number as varint, fixed32, fixed64, length-delimited (§4.6), or dropped |
+   | A known field number with the wrong wire type | Treated as an unknown field, as ScalaPB does (§4.6) |
+   | A packable field with options, encoded | Packed, the proto3 default (§4.6) |
+   | `-0.0` in a singular `double` | Omitted on write, as ScalaPB's IEEE check does (§4.6) |
+   | A oneof member between two plain fields | Written at its own field number (§3 dec. 4) |
    | An enum number not in the enum | `Unrecognized(n)` and back |
    | A mapping failure | `DecodeError::Map` |
    | Truncated: inside a varint, a length prefix, a fixed64 | `DecodeError`, not a panic |
-   | Invalid: a length past the end, wire type 6 or 7, tag 0, a varint over 10 bytes, a group | `DecodeError`, not a panic |
+   | Invalid: a length past the end, wire type 6 or 7, tag 0, a varint over 10 bytes | `DecodeError`, not a panic |
+   | An unknown group | `DecodeError` where unknown fields are preserved; skipped where they are not (§4.6) |
+   | Depth bombs: nested messages, maps, groups past 100 levels | `DecodeError`, no stack overflow (§4.6) |
    | Invalid UTF-8 in a `string` | `DecodeError`, as ScalaPB's parser rejects it |
 
 5. **Mutations.** Break the derive (swap a tag, drop zigzag, skip an unknown
    field) and require a test to fail.
 6. **rust-js.** The same corpus is run through the JS output, compared
    against native rustpb (§7).
+7. **Differential fuzzing against ScalaPB: the primary oracle.** Mutated
+   bytes and JSON are fed to both decoders; values, failures and re-encoded
+   bytes are compared. The corpus is seeded with one input per Rust protobuf
+   security advisory. CI fuzzes every change (CIFuzz-style, time-boxed), as
+   prost does. The first single-sided oracle is prost's own: `encoded_len`
+   equals the bytes written, and re-encoding a decoded value is stable.
+8. **Google's conformance runner: the secondary oracle.** It runs on proto3
+   binary and JSON, natively and on the rust-js output, each with an exact
+   failure list (a test that starts passing is also a failure). The JSON
+   list records every deliberate scalapb-jsoniter 0.1.2 deviation (§5), so
+   the deviations are documented by the test suite itself. buffa and
+   prost-reflect run clean; prost skips JSON entirely.
+9. **Per-mapper round-trip tests.** For each mapper, `rustpb-build`
+   generates a property test `to_base(to_custom(b)?) == b`. A mapper that
+   is lossy on purpose, such as default-on-bad-id, declares it with
+   `(rustpb.field).lossy = true`, and its test then checks only the
+   non-lossy subset. One Rust crate's UUID mapper silently rewrites
+   hyphenated ids on re-encode, which this catches.
+10. **Varint and zigzag arithmetic** is checked with Kani proofs, as prost's
+    is, both for the native path and for the two-32-bit-halves path the JS
+    output uses for 64-bit fields (§7).
 
 ## 7. The rust-js side (separate ADR in rust-js)
 
@@ -543,7 +661,7 @@ Two ways to get `encode`/`decode` into JavaScript:
 
 | | Compile the derive's expansion | Compiler-owned lowering (serde's way, rust-js ADR 0077) |
 |---|---|---|
-| How | rust-js compiles the `prost::encoding` calls as ordinary Rust | rustc checks the derive. rust-js skips its expansion, reads the `#[rustpb(..)]` attributes, and emits readable code on a small runtime |
+| How | rust-js compiles the `rustpb::wire` calls as ordinary Rust | rustc checks the derive. rust-js skips its expansion, reads the `#[rustpb(..)]` attributes, and emits readable code on a small runtime |
 | JS readability | Poor: generic `Buf` code | Good: `writer.string(3, value.orderId)` |
 | Speed | Every varint is u64 BigInt math | Number for ≤32-bit fields, BigInt only for 64-bit fields |
 | Risk | `bytes` crate's unsafe code may be refused | Two implementations of one rule (native derive, rust-js lowering), held equal by running both on §6's corpus |
@@ -551,6 +669,13 @@ Two ways to get `encode`/`decode` into JavaScript:
 Recommendation: start with compile-the-expansion for correctness, and move
 to compiler-owned lowering, as serde did. JSON needs neither: it is
 serde, already supported.
+
+For 64-bit fields, the JS path decodes a varint as two 32-bit halves and
+builds the BigInt once at the field boundary, as protobufjs's `long`
+handling does, never a BigInt operation per byte. Kani proves it equal to
+the `u64` path (§6.10). No other pure-Rust protobuf runtime targets
+JavaScript, so rustpb's JS build runs the same conformance and fuzz loops
+as the native build, not just the corpus.
 
 ## 8. Milestones
 
@@ -573,10 +698,14 @@ serde, already supported.
    (closer to Scala, nondeterministic bytes)?
 4. Generated-enum naming: keep proto's `SCREAMING_CASE` values with prefix
    stripping, as prost does?
-5. Do the 2 `service` declarations need code (gRPC via tonic), or only messages?
+5. Do the 2 `service` declarations need code (gRPC via tonic), or only
+   messages? If they do, tonic-build is codec-agnostic (`codec_path`), so a
+   rustpb codec plugs in; tonic-prost-build would tie them to prost.
 6. Time types: which Rust crate replaces `java.time.Instant`/`LocalDate`
    (`jiff` or `chrono`), and do the mappers live in rustpb or in the app?
 7. scalapb-jsoniter 0.1.2 silently skips proto-name keys (`my_field`).
    Fix it on both sides together (an alias in the Scala parser and in
    rustpb, by one decision), or keep matching it? rustpb matches 0.1.2
-   until this is decided.
+   until this is decided. Prior art argues for fixing it: the ProtoJSON
+   spec requires parsers to accept both names, and every Rust JSON reader
+   surveyed does.
