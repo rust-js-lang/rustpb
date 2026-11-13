@@ -5,7 +5,7 @@ Research date: 2026-11-13. Local shallow clones read: prost at 894f4a7 (2026-11-
 ## Security advisories (RustSec / CVE / GHSA) for Rust protobuf crates
 
 ### Takeaway
-Every Rust protobuf advisory on record is a denial-of-service from untrusted input. Two shapes cover all of them: (1) recursion with no bound, which overflows the stack (prost 2020, rust-protobuf 2024/2025, through unknown groups), and (2) allocation sized by a length prefix the attacker controls (rust-protobuf 2019). A third, smaller class is panics on arithmetic overflow in well-known-type conversions (prost-types 2021). RustPB needs a recursion budget on every recursive path, including unknown-field and group skipping. It must never reserve memory from a length prefix before checking it against the bytes that remain. Its WKT conversions must be fallible.
+Every Rust protobuf advisory on record is a denial-of-service from untrusted input (RUSTSEC-2020-0002 also notes possible memory corruption on targets without stack probes). Two shapes cover all of them: (1) recursion with no bound, which overflows the stack (prost 2020, rust-protobuf 2024/2025, through unknown groups), and (2) allocation sized by a length prefix the attacker controls (rust-protobuf 2019). A third, smaller class is panics on arithmetic overflow in well-known-type conversions (prost-types 2021). RustPB needs a recursion budget on every recursive path, including unknown-field and group skipping. It must never reserve memory from a length prefix before checking it against the bytes that remain. Its WKT conversions must be fallible.
 
 ### Cited Findings
 - **RUSTSEC-2020-0002 / CVE-2020-35858 / GHSA-gv73-9mwv-fwgq (prost)**: "decoding untrusted input could overflow the stack". On architectures without stack probes (e.g. ARM), the advisory says the overflow "is unsound and can result in potential memory corruption (or even RCE)". GHSA titles it "Out of bounds write in prost". Fixed in **prost 0.6.1**; published 2020-01-16; upstream issue tokio-rs/prost#267. — [OSV RUSTSEC-2020-0002](https://api.osv.dev/v1/vulns/RUSTSEC-2020-0002); [RustSec](https://rustsec.org/advisories/RUSTSEC-2020-0002.html); [issue #267](https://github.com/tokio-rs/prost/issues/267)
@@ -78,7 +78,7 @@ Upstream says outright that default serialization "is not deterministic". prost 
 - "the default serialization is not deterministic"; the byte output should not be assumed stable. — [protobuf.dev Encoding guide](https://protobuf.dev/programming-guides/encoding/)
 - prost #965 "feature: Deterministic Serialization" (open, 2023-12-21) asks for a semver guarantee on field order (by tag) and map order when using the `BTreeMap` option. — [prost #965](https://github.com/tokio-rs/prost/issues/965)
 - prost #736 "Recursion limit during encode" (open, 2022-10-26): "it is possible to encode a message that cannot be decoded anymore". Context: the Apache Arrow DataFusion project hit it. — [prost #736](https://github.com/tokio-rs/prost/issues/736)
-- prost #1112: `encoded_len` "gets computed twice when encoding a message" (open, 2024-07-30). This is a performance issue: nested sizes are computed again for each level. — [prost #1112](https://github.com/tokio-rs/prost/issues/1112)
+- prost #1112: `encoded_len` "gets computed twice when encoding a message" (open, 2024-07-30). This is a performance issue. The issue itself reports the top-level double count; separately, `message::encode` calls `encoded_len()` at every level, so nested sizes are recomputed per level. — [prost #1112](https://github.com/tokio-rs/prost/issues/1112)
 - prost's `tests::roundtrip` (used by its fuzzers):
   1. Decode the input.
   2. Compute `encoded_len()`, encode, and fail if `encoded_len != buf1.len()`.
@@ -96,7 +96,7 @@ Upstream says outright that default serialization "is not deterministic". prost 
 ## Testing practices: conformance, fuzzing, differential, formal
 
 ### Takeaway
-The strongest test pattern in the Rust ecosystem combines four things: (1) the upstream conformance runner with an exact-match failure list, (2) round-trip fuzzing on `TestAllTypesProto2/3` with an `encoded_len` check, (3) continuous fuzzing on OSS-Fuzz run on every PR through CIFuzz, and (4) interop tests against the C++ implementation. prost runs conformance for **binary only**: JSON and text-format requests are reported as Skipped. Buf's conformance results for JS libraries show how much is missed without the suite: protobufjs was about 31% compliant.
+The strongest test pattern in the Rust ecosystem combines four things: (1) the upstream conformance runner with an exact-match failure list, (2) round-trip fuzzing on `TestAllTypesProto2/3` with an `encoded_len` check, (3) continuous fuzzing on OSS-Fuzz run on every PR through CIFuzz, and (4) interop tests against the C++ implementation. prost runs conformance for **binary only**: JSON and text-format requests are reported as Skipped. Buf's conformance results for JS libraries showed how much is missed without the suite: protobufjs was about 31% compliant at launch (zero failures today).
 
 ### Cited Findings
 - **Conformance protocol**: the runner (`conformance_test_runner`) sends a `ConformanceRequest` to a "testee" program and expects a `ConformanceResponse`. `--failure_list <file>` must match **exactly**: a listed test that passes is also an error. Lists use wildcards (a trie over dot-separated names). Upstream keeps per-language lists, including `failure_list_rust_upb.txt`. — [conformance_test_runner.cc (mirror)](https://flutter.googlesource.com/third_party/protobuf/+/refs/heads/36.x/conformance/conformance_test_runner.cc); [failure_list_cpp.txt (mirror)](https://flutter.googlesource.com/third_party/protobuf/+/b4262af656bd3971cd2b2c9e51797982a8e9d91c/conformance/failure_list_cpp.txt); search-snippet level only, pages not opened.
@@ -123,7 +123,7 @@ The strongest test pattern in the Rust ecosystem combines four things: (1) the u
 - **quick-protobuf**: tests are `write_read.rs`, `rust_proto.rs`, `packed_primitives`, and a `rust_protobuf` comparison directory. I found no fuzz or conformance directories in the clone. — Local: `quick-protobuf/quick-protobuf/tests/`
 - **Buf's JS conformance survey (2023-03-21)**:
   - Protobuf-ES passes 100% of required and 99.8% of recommended tests (later quoted as 99.95%; its one failure was proto2 extensions).
-  - protobufjs is about 31% compliant.
+  - protobufjs was then about 31% compliant (Buf's README now shows zero failures for it).
   - The new Duration tests caught a Protobuf-ES JSON bug where negative durations lost their sign ("-0.1s" became "0.1s").
   - The suite has over 2,000 tests.
   — [Buf blog: Protobuf-ES conformance](https://buf.build/blog/protobuf-conformance)
@@ -145,7 +145,7 @@ The strongest test pattern in the Rust ecosystem combines four things: (1) the u
 The leading JS implementation (Protobuf-ES) uses `bigint` for 64-bit fields by default and offers `[jstype = JS_STRING]` to opt into strings, falling back to strings where BigInt is unavailable. protobufjs needs the separate `long` package for exact 64-bit values and otherwise loses precision above 2^53. Its unknown-field handling has changed between releases (preserved vs discarded by default), a cautionary example: a compatibility layer must preserve unknown fields by default and never change that silently.
 
 ### Cited Findings
-- Protobuf-ES: `bigint` is the default for 64-bit scalars. `jstype = JS_STRING` generates `string` fields. Where BigInt is unavailable, 64-bit fields still round-trip without loss but hold strings. — search-result summary of [Protobuf-ES manual (mirror)](https://github.wsshow666.workers.dev/bufbuild/protobuf-es/blob/main/MANUAL.md) and [@bufbuild/protobuf proto-int64.d.ts](https://cdn.jsdelivr.net/npm/@bufbuild/protobuf@2.12.0/dist/cjs/proto-int64.d.ts) (the direct GitHub MANUAL.md fetch returned 404; treat as secondary).
+- Protobuf-ES: `bigint` is the default for 64-bit scalars. `jstype = JS_STRING` generates `string` fields. Where BigInt is unavailable, 64-bit fields still round-trip without loss but hold strings. — search-result summary of the Protobuf-ES manual (`MANUAL.md`, seen only through a mirror) and [@bufbuild/protobuf proto-int64.d.ts](https://cdn.jsdelivr.net/npm/@bufbuild/protobuf@2.12.0/dist/cjs/proto-int64.d.ts) (the direct GitHub MANUAL.md fetch returned 404; treat as secondary).
 - protobufjs:
   - For exact 64-bit support, install `long`. Otherwise 64-bit values fall back to JS numbers, with precision loss above 2^53.
   - The docs conflict across versions on unknown fields: some say they are kept by default and re-emitted (`message.$unknowns`). Later releases say fields "present on the wire are discarded by default" as "the safer default".
@@ -172,7 +172,7 @@ The leading JS implementation (Protobuf-ES) uses `bigint` for 64-bit fields by d
 I found little hard evidence. The one concrete prost data point is a discussion asking for one module per `.proto`, because the single generated file pushed compile times over 25 s and slowed IDE indexing. The maintainer replied it was not supported but could become opt-in. prost-build also includes every transitively imported `.proto`.
 
 ### Cited Findings
-- prost discussion #755: a user asks prost_build to emit one Rust module per `.proto` file because the single generated file makes compile times exceed 25 seconds and slows IDE indexing. The maintainer: "Prost doesn't support this though this could be something we add as an opt-in behavior." — [prost discussion #755](https://github-redirect.dependabot.com/tokio-rs/prost/discussions/755) (search-snippet level)
+- prost discussion #755: a user asks prost_build to emit one Rust module per `.proto` file because the single generated file makes compile times exceed 25 seconds and slows IDE indexing. The maintainer: "Prost doesn't support this though this could be something we add as an opt-in behavior." — [prost discussion #755](https://github.com/tokio-rs/prost/discussions/755) (search-snippet level)
 - prost-build docs: transitively imported `.proto` files are included automatically. — [prost-build docs](https://docs.rs/prost-build/0.14.4/src/prost_build/lib.rs.html) (search-snippet level)
 - prost #1021 "Consider placing `Config::format` behind a feature flag" (closed 2024-03-30). This is a build dependency cost (prettyplease) of formatting generated code. — [prost #1021](https://github.com/tokio-rs/prost/issues/1021)
 - A non-Rust example of the same failure mode: a Perfetto schema produced about 532k lines of Zig, and the build was killed (suspected OOM). — [Ziggit thread](https://ziggit.dev/t/suggestions-for-huge-amount-of-generated-code/14558)

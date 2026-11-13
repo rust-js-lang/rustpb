@@ -196,9 +196,11 @@ the text lists for both Rust kernels are empty — `wc -l` in the local [protobu
      guessed.
 - Run with `--maximum_edition PROTO3 --enforce_recommended`. rustpb is proto3-only (design §2), so the
   testee answers `skipped` for `TestAllTypesProto2`. **Skips never fail a run, so the harness must assert the
-  skip set too.** Parse the `--verbose` output, or count requests on the testee side, and require exactly the
-  1,476 proto3 binary+JSON tests to be answered (counts per runner version). Without that check, a testee that
-  skips everything "passes".
+  skip set too.** Counting *requests* is not enough: a testee can count every request and still answer
+  `skipped` to all of them (review #2 R2). The testee must log the category of each *answer*; in the proto3
+  binary+JSON scope, `skipped` answers must be zero and non-skipped answers must equal the pinned count
+  (1,476 at v33.0.0), and every name in the `--verbose` skipped list must be out of scope. The initial
+  `FailureSet` handshake is excluded explicitly. Without that check, a testee that skips everything "passes".
 - Text-format tests: rustpb has no text format, so answer `skipped`. They don't count, and need no failure list.
 - Use the **same testee source twice**: native, and through rust-js under Bun (`#!/usr/bin/env -S bun run`
   or a `bun` wrapper script). Give each its own failure list, as buffa does per mode. Run the JS testee a

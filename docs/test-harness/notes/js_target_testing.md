@@ -107,8 +107,8 @@ The upstream runner's failure list is strict: a listed test that passes is repor
   - — [protobufjs 8.7.x README (jsDelivr)](https://cdn.jsdelivr.net/npm/protobufjs@8.7.0/README.md)
 
 ### Inferences
-- rustpb's JS build can be a conformance testee exactly as protobuf-es is. Native rustpb gets its own `failure_list_native.txt` and the JS build its own list. The strongest check is that **the two lists are identical**: any line in one and not the other is a native/JS divergence. This can be a test of its own, beyond what design §6.8 already says.
-- Because rustpb maps u64/i64 to BigInt unconditionally, the protobuf-es "without BigInt" configuration does not apply. But its 44 failures show where a JS build is weakest: **int64 values as unquoted JSON numbers**. rustpb's JSON comes through serde, whose numbers rust-js reads itself, not through `JSON.parse`. That is worth one targeted test row: parse `{"x": 18446744073709551615}` natively and as JS and compare.
+- rustpb's JS build can be a conformance testee exactly as protobuf-es is. Native rustpb gets its own `failure_list_native.txt` and the JS build its own list. The strongest check is that **the two lists are identical** once the JS build is blocking: any line in one and not the other is a native/JS divergence. This can be a test of its own. (Design §6.5 later splits each list into a measured ScalaPB baseline and a temporary unsupported list, so native/JS equality holds while features are still missing.)
+- Because rustpb maps u64/i64 to BigInt unconditionally, the protobuf-es "without BigInt" configuration does not apply. But its 44 failures show where a JS build is weakest: **int64 values as unquoted JSON numbers**. rustpb's JSON is read by rustpb's own reader (design §5), plain Rust compiled by rust-js, not `JSON.parse`. That is worth one targeted test row: parse `{"x": 18446744073709551615}` natively and as JS and compare.
 - protobuf-es tests Node, Bun and Deno, but no browser, for conformance. The conformance runner needs stdin/stdout, so browsers are covered only by rustpb's own e2e (§6.11), not by conformance.
 
 ### Gaps
@@ -150,7 +150,7 @@ Playwright covers Chromium, Firefox and WebKit on one CI host. rust-js already w
 - **`JSON.parse` source text access.**
   - The reviver's `context.source` exposes a number's raw text, which is the standard way to read int64 JSON numbers exactly. It is Stage 4 (spec draft dated 2025-11-23).
   - The web-features explorer lists it as "Limited availability": Chrome/Edge 114 and Firefox 135, Safari not listed. — [TC39 proposal](https://tc39.es/proposal-json-parse-with-source/), [web-features: json-raw](https://web-platform-dx.github.io/web-features-explorer/features/json-raw)
-  - A TypeScript PR claims all major browsers and Node 22+. This is secondary and conflicts with the explorer. — [TypeScript PR #63248 (mirror)](https://gh.mise.run.place/microsoft/TypeScript/pull/63248)
+  - A TypeScript PR claims all major browsers and Node 22+. This is secondary and conflicts with the explorer. — TypeScript PR #63248 (seen only through a mirror; unverified)
 - **Playwright in CI.**
   - The docs recommend `workers: process.env.CI ? 1 : undefined` "to prioritize stability and reproducibility". Sharding across CI jobs is the way to parallelise.
   - Install with `npx playwright install --with-deps`, or use the image `mcr.microsoft.com/playwright:v1.64.1-noble`.
@@ -281,7 +281,7 @@ The server enables permissive CORS. The tests cover a success path, an invalid U
   - **Port.** Bind port 0 and have the server print its port, instead of hard-coding 8080: parallel CI jobs or a stale server collide on a fixed port.
   - **Readiness.** Keep the "process died" check in the readiness loop.
   - **Timeouts.** Give every step a hard timeout (which rust-js's AGENTS.md also demands).
-  - **Retries.** Set Playwright `retries: 0`, so a flake is investigated rather than hidden. This is my inference; Playwright's page did not cover retries.
+  - **Retries.** Set Playwright `retries: 0`, so a flake is investigated rather than hidden. This is my inference; Playwright's own sample config uses `retries: 2` in CI.
 - **What the e2e should assert.** Assert byte equality of what crossed the wire, not just "a reply arrived". The server echoes the raw body hex and its own decoded `Debug`, and the browser test compares both against its own encode and decode. That makes the e2e a differential test across the network for the §6.11 cases (mapped id, sealed oneof, `Unrecognized` enum, unknown fields), in binary and JSON.
 - The connect-rust tests' negative cases (bad URL, unreachable server) are cheap and catch transport error-mapping. rustpb's equivalent negatives are a truncated body and a body with invalid UTF-8 in a `string`, decoded in the browser.
 
