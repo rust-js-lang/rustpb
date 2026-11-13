@@ -302,10 +302,24 @@ follow-up). rustpb copies that graph exactly:
 
    `DefaultError` names the path that failed, such as
    `Parent.child.owner_id`, and keeps the mapper's `MapError`.
-   The public `try_default()` runs on a fresh `DecodeOptions::untrusted()`
-   budget. Generated code also has an internal
-   `try_default_in(&mut Budget)`, and the decoder calls that one, so an
-   absent subtree is charged to the running decode's budget (§4.6).
+
+   **A semantic default is not a budget question** (review #3). A
+   message's default is fixed by its schema: its depth and size are finite,
+   because cycles are refused (item 2), and no input can change them. So
+   the two are kept apart:
+   - `try_default()` is the semantic default, the twin of
+     `defaultInstance`. It takes no budget, and fails only with a
+     mapper's `DefaultError::Map`, never with a resource limit.
+   - `try_default_with(&DecodeOptions)` builds the same value under
+     explicit limits. When they are too small it returns
+     `DefaultError::Limit`, never a different value. `rustpb-build`
+     generates `M::DEFAULT_DEPTH`, the number of message levels `M`'s
+     default builds, `M` included, so a caller can size the limit.
+   - Both call the internal `try_default_in(&mut Budget)`:
+     `try_default()` with an unlimited budget, `try_default_with` with one
+     made from its options. The decoder calls it with its own running
+     budget: an absent subtree is charged to
+     that decode, at the depth where it sits (§4.6).
 2. **Defaultability is computed by `rustpb-build`** over the whole
    descriptor set, imports included, as a fixed point. A message is
    **non-defaultable** if it declares `default = false`, or if any singular
@@ -320,10 +334,14 @@ follow-up). rustpb copies that graph exactly:
    "unsupported default-construction cycle" error that names the cycle,
    instead of generating a recursive `Default` that overflows the stack. An
    optional, oneof or repeated edge breaks the cycle, because its default
-   is `None` or empty and needs no call.
+   is `None` or empty and needs no call. Defaultability is a property of
+   the schema alone: a resource budget never changes it.
 3. **`impl Default` exists exactly for defaultable messages.** It is
-   infallible: scalars, `Child::default()`, and `default_custom()`. A
-   generated test asserts `M::try_default() == Ok(M::default())` for each.
+   infallible: scalars, `Child::default()`, and `default_custom()`. For
+   each, generated tests assert `M::try_default() == Ok(M::default())`;
+   `try_default_with` at depth `M::DEFAULT_DEPTH`, with generous size
+   limits, equals `Ok(M::default())`; and at depth `M::DEFAULT_DEPTH − 1`
+   it gives `Err(DefaultError::Limit)`.
    A non-defaultable message has no `impl Default`; its default
    construction is only `try_default()`, which fails as ScalaPB's would.
    `DefaultMapper` is required only for singular mapped fields of
@@ -385,6 +403,16 @@ Fixtures for the graph, each checked against ScalaPB:
   does.
 - Three levels deep (`Grandparent → Parent → Child`): the error path names
   all three.
+- A finite, acyclic chain of 102 messages, each an unmapped `no_box` child
+  of the one before, ending in an empty message. Every message is
+  defaultable, and the root's `DEFAULT_DEPTH` is 102. `Default` and
+  `try_default()` build it and agree. `try_default_with` at depth 100
+  fails cleanly with `DefaultError::Limit`, and at depth 102 equals
+  `Default`. Decoding an empty root fails with a resource-limit
+  `DecodeError` under `untrusted()`, and decodes to `Default` under a
+  caller depth of 102 or more, matching ScalaPB's recorded value. Nested
+  inside a message at depth *d*, it needs *d* + 102: the subtree shares
+  the decode's budget.
 
 Fixtures, each checked against ScalaPB:
 
@@ -411,7 +439,7 @@ Fixtures, each checked against ScalaPB:
 |---|---|
 | `case class M(..)` | `pub struct M { pub .. }`, `Clone`, `PartialEq`, `Debug`; `Default` only for defaultable messages (§4.1) |
 | message field `Option[T]` | `Option<T>`; `Option<Box<T>>` only where the type is recursive (rustc requires it) |
-| `no_box` | `T`. Missing on the wire → `T::try_default()?`, or for a mapped field `to_custom(base default)` (§4.1, defaults compose) |
+| `no_box` | `T`. Missing on the wire → `T`'s default, built on the decode's budget (`try_default_in`), or for a mapped field `to_custom(base default)` (§4.1, defaults compose) |
 | `required` | `T`; decode fails with `DecodeError` naming the field when absent |
 | `repeated` → `Seq` | `Vec<T>` |
 | `collection_type = "Set"` | `BTreeSet<T>` (deterministic bytes; open question 3) |
@@ -547,7 +575,7 @@ memory where stack probes are missing):
 
 - **One depth budget**, default 100 as in C++ and protobuf-java, shared by nested-message
   decode, map-entry decode, unknown-group skipping, JSON input nesting and
-  default construction. Exceeding it is a `DecodeError`, never a stack
+  defaults built during a decode (or by `try_default_with`). Exceeding it is a `DecodeError`, never a stack
   overflow (RUSTSEC-2020-0002, RUSTSEC-2024-0437). Encoding checks the same
   depth, so rustpb never writes a message it cannot read back (prost #736).
   This is stricter than ScalaPB, which writes such a message and fails
@@ -586,17 +614,22 @@ memory where stack probes are missing):
     reader is rustpb's own (§5), so no serde visitor has to carry it. The
     total-size limit is checked on the input length before parsing;
   - **defaults:** an absent `no_box` or `required` subtree is built by
-    `try_default_in(&mut budget)` (§4.1), not by a fresh call.
+    `try_default_in(&mut budget)` (§4.1) at the depth where it sits, not
+    by a fresh call. A schema whose absent subtree needs more than the
+    caller's limits fails that decode with a resource-limit error; a
+    caller that selects larger limits decodes it.
 
-  Entry points without options (`decode(bytes)`, `from_str(s)`,
-  `try_default()`) use `DecodeOptions::untrusted()`.
+  Decode entry points without options (`decode(bytes)`, `from_str(s)`)
+  use `DecodeOptions::untrusted()`. `try_default()` takes no budget: it
+  is the semantic default (§4.1), sized by the schema, not by input.
 - **Comparing limits with ScalaPB.** Resource-limit errors are their own
   outcome class (§6.2). ScalaPB's limits are measured, not assumed, by the
   limit − 1 / limit / limit + 1 fixtures: for nested messages it has none
   (above), and jsoniter's JSON depth is recorded by the worker. Until
   recorded, those fixtures are `i_` (§6.3). Where rustpb is stricter on purpose (the encode depth
-  check; memory and element counts ScalaPB doesn't have), the fixture
-  records a named deviation with its reason, never an unexplained
+  check; memory and element counts ScalaPB doesn't have; a default subtree
+  deeper than the caller's limit, which ScalaPB builds without one), the
+  fixture records a named deviation with its reason, never an unexplained
   mismatch.
 
 Fixtures: depth bombs through messages, maps and unknown groups; a huge
