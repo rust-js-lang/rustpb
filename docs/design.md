@@ -61,6 +61,7 @@ TypeMappers are ~223 hand-written Scala files, mostly ids.
  ├── rustpb-derive     #[derive(rustpb::Message)]: encode/decode/size/merge, Default
  ├── rustpb-build      .proto → Rust source, called from build.rs
  ├── rustpb-json       proto3 JSON (serde impls), matching the Scala app's printer
+ ├── rustpb-migrate    coexistence tool: add / check / drop-scalapb (§4.5)
  └── proto/rustpb.proto   the custom options, like scalapb/scalapb.proto
 
  rust-js/                     (separate repo, its own ADR)
@@ -96,10 +97,12 @@ TypeMappers are ~223 hand-written Scala files, mostly ids.
 ### 4.1 TypeMapper → `rustpb::TypeMapper`
 
 ```rust
-pub trait TypeMapper<Base> {
+pub trait TypeMapper<Base: Default> {
     type Custom;
     fn to_custom(base: Base) -> Result<Self::Custom, MapError>;
     fn to_base(custom: &Self::Custom) -> Base;
+    /// Must equal `to_custom(Base::default())`. Generated tests check it.
+    fn default_custom() -> Self::Custom;
 }
 ```
 
@@ -134,13 +137,46 @@ pub trait TypeMapper<Base> {
 - `key_type`, `value_type`: the same trait, applied to map keys and values.
 - In JSON, a mapped field prints its *base* value, as ScalaPB's does.
 
+#### Defaults and failures of mapped fields (review #1, finding 3)
+
+ScalaPB's rules, read from its generator, and rustpb's twin of each:
+
+| Moment | ScalaPB (`ProtobufGenerator`, `ParseFromGenerator`) | rustpb |
+|---|---|---|
+| Decoding | Reads the *base* value: the last occurrence wins for scalars, and occurrences merge for messages. Then calls `toCustom` **once**, after the whole message is read | The same: base first, `to_custom` once at the end |
+| Field absent | `toCustom(base default)`, e.g. `toCustom("")` or `toCustom(TimestampMessage.defaultInstance)` | `to_custom(Base::default())`, never the custom type's own `Default` |
+| Mapping fails | The exception escapes `parseFrom` | `DecodeError::Map { field, source }`; no panic, no substitute value |
+| Encoding | Writes the field only if `toBase(value)` differs from the base default | The same test, on `to_base(value)` |
+| Default instance / constructor default | `toCustom(base default)`, evaluated lazily, so a mapper that rejects it throws on first use | `default_custom()`: infallible, so `impl Default` never panics and never needs `Custom: Default` |
+
+`default_custom()` is the only new obligation. For every mapper a crate
+uses, `rustpb-build` generates a `#[test]` asserting
+`M::to_custom(Base::default()) == Ok(M::default_custom())`. This is the
+one intentional departure from ScalaPB: **rustpb refuses a mapper that
+rejects its base default.** ScalaPB accepts such a mapper and fails at run
+time, the first time the message's default is touched. rustpb fails at
+`cargo test`, naming the mapper and the field. To port such a mapper, make
+it accept the base default.
+
+Required fixtures:
+
+- A mapper whose mapped base default differs from the custom type's
+  `Default`. For example, an id whose `Default` is a sentinel, but
+  `to_custom("")` gives the registry's default id. An absent field must
+  decode to the latter.
+- A mapper that rejects the base default. The generated test must fail
+  with the field's name, and decoding a message with that field absent
+  must return `DecodeError::Map`.
+- A mapper that rejects one non-default value. Decoding must return
+  `DecodeError::Map`; encoding of every accepted value must round-trip.
+
 ### 4.2 Messages, fields, enums
 
 | ScalaPB | rustpb |
 |---|---|
 | `case class M(..)` | `pub struct M { pub .. }`, `Default`, `Clone`, `PartialEq`, `Debug` |
 | message field `Option[T]` | `Option<T>`; `Option<Box<T>>` only where the type is recursive (rustc requires it) |
-| `no_box` | `T` (missing on the wire → `T::default()`) |
+| `no_box` | `T`. Missing on the wire → `T::default()`, or for a mapped field `to_custom(Base::default())` (§4.1) |
 | `required` | `T`; decode fails with `DecodeError` naming the field when absent |
 | `repeated` → `Seq` | `Vec<T>` |
 | `collection_type = "Set"` | `BTreeSet<T>` (deterministic bytes; open question 3) |
@@ -154,19 +190,42 @@ pub trait TypeMapper<Base> {
 ### 4.3 Oneofs
 
 - Plain `oneof x` → `pub x: Option<m::X>` with `enum X { A(..), B(..) }`.
-- **`sealed_oneof`** (`oneof sealed_value`) → the message *is* the enum:
+- **Sealed oneofs** come in ScalaPB's two styles, chosen by the oneof's
+  name (`DescriptorImplicits.sealedOneofStyle`). Both are kept, because
+  emptiness must survive in *every* position: top level, singular field,
+  repeated element, map value (review #1, finding 1).
+
+  **`oneof sealed_value`** (default style, 108 files): the message *is* an
+  enum, with `Empty` as a real variant, as ScalaPB's `case object Empty`:
 
   ```rust
+  #[derive(Default)]
   pub enum ApiParams {
+      #[default]
+      Empty,
       GetItemParams(GetItemParams),
       UpdateItemParams(UpdateItemParams),
       // ..
   }
   ```
 
-  Where it appears as a field, it is `Option<ApiParams>`. `None` plays the
-  role of ScalaPB's `Empty` case. This is the most natural Rust of the
-  whole mapping.
+  Every position uses the enum itself, never `Option<ApiParams>`, as
+  ScalaPB uses `ApiParams`: a field is `ApiParams`, a repeated field is
+  `Vec<ApiParams>`, a map value is `ApiParams`. An empty message on the
+  wire, at any of those positions, decodes to `ApiParams::Empty`, and
+  `Empty` encodes as an empty message. `Option` would only cover singular
+  fields, and would give `Vec<Option<ApiParams>>` a second meaning of empty.
+
+  **`oneof sealed_value_optional`** (16 files): no `Empty` variant. Every
+  position is `Option<S>`, as ScalaPB types it `Option[S]` everywhere
+  (`sealedOneofScalaType`): the field is `Option<S>`, repeated is
+  `Vec<Option<S>>`, a map value is `Option<S>`, and decoding a top-level
+  message gives `Option<S>`.
+
+  Fixtures for both styles, in binary and JSON: empty top level, an empty
+  singular field, an empty element in the middle of a repeated field, and an
+  empty map value. Each must decode to `Empty` or `None` and re-encode to the
+  bytes ScalaPB writes.
 
 ### 4.4 Options with no Rust counterpart: dropped, with reasons
 
@@ -188,11 +247,39 @@ pub trait TypeMapper<Base> {
 | `annotations`, field `annotations` | `(rustpb.message).attributes`, `(rustpb.field).attributes`: Rust attributes |
 | `derives` | `(rustpb.message).derive: "Hash"`, added to the derive list |
 
-**Migration converts options mechanically:** a script rewrites
-`(scalapb.*)` to `(rustpb.*)` in every `.proto` file. It translates Scala
-type syntax (`Option[UserId]` → `Option<UserId>`, `java.time.Instant` → its
-mapped Rust type) and lists every option it dropped, file by file, for a
-human to check.
+#### Migration: both option sets live side by side (review #1, finding 2)
+
+Scala and Rust services share the same `.proto` files while both exist,
+and Scala generation still needs every `(scalapb.*)` option. So the
+migration tool **adds** `(rustpb.*)` options next to the ScalaPB ones and
+removes nothing:
+
+```protobuf
+import "scalapb/scalapb.proto";
+import "rustpb/rustpb.proto";
+
+string created_by = 4 [(scalapb.field).type = "Option[UserId]",
+                       (rustpb.field).type  = "Option<UserId>",
+                       (rustpb.field).mapper = "OptionalUserId"];
+```
+
+Each generator ignores the other's options, as protoc plugins do with
+unknown extensions. One schema stays the single source of truth;
+generated Rust-only copies were rejected because they would drift
+from what Scala reads.
+
+- **`rustpb-migrate add`** derives the `rustpb` options from the ScalaPB
+  ones. It translates Scala type syntax (`Option[UserId]` → `Option<UserId>`,
+  `java.time.Instant` → its mapped Rust type, through a mapping table) and
+  lists every ScalaPB option with no Rust form (§4.4), file by file, for a
+  human to check.
+- **`rustpb-migrate check`** runs in CI during coexistence. It fails when the
+  two sets disagree, for example a field mapped for Scala but not for
+  Rust, or a `required` or collection type on one side only. A schema edit
+  can't silently update only one language.
+- **ScalaPB options are removed only after the last Scala consumer is
+  gone**, by `rustpb-migrate drop-scalapb`. rustpb itself never reads
+  `(scalapb.*)` options: only the migration tool knows ScalaPB.
 
 ## 5. JSON
 
@@ -203,7 +290,7 @@ So the format is **canonical proto3 JSON**:
 
 | Rule | Value |
 |---|---|
-| Field names | lowerCamelCase (`json_name`); the parser takes proto names too |
+| Field names | lowerCamelCase (`json_name`) |
 | Default values | omitted (`0`, `""`, `false`, empty lists and maps, unset messages) |
 | `int64`, `uint64`, `fixed64` | strings, `"123"` |
 | Enum *fields* | names, `"ACTIVE"` |
@@ -233,6 +320,33 @@ How rustpb-json does it:
   (§6). The pinned scalapb-jsoniter version matters: if the Scala side
   upgrades, the goldens are re-made and compared.
 
+#### The reference parser's contract (review #1, finding 4)
+
+The reference is **scalapb-jsoniter 0.1.2**: the version the app's build
+and its shared codec library both pin. Its parser was read at tag
+`v0.1.2` (`JsonFormat.scala`, `Parser.parseObject`), not inferred from the
+printer settings. It does **not** follow canonical ProtoJSON on reading:
+
+| Input | scalapb-jsoniter 0.1.2 | Canonical ProtoJSON | rustpb |
+|---|---|---|---|
+| Proto field name `my_field` | **Skipped silently**: only the `json_name` is indexed | Accepted as an alias | **Skipped, as 0.1.2 does** |
+| Unknown key | Skipped | Error by default | Skipped |
+| `"field": null` | Treated as absent (default) | Treated as absent | Treated as absent |
+| Same key twice | The last one wins, a repeated field's array included | Error | The last one wins |
+| Two members of one oneof | Both reach the reader; the result is fixture-defined | Error | Whatever the fixture records 0.1.2 doing |
+
+Matching 0.1.2 exactly is the decision: a JSON value must decode the same
+in a Scala and a Rust service during coexistence, even where 0.1.2 is
+lenient. Silently dropping `my_field` is a data-loss trap, but changing it
+is a behaviour change for the Scala side too. It is listed as open
+question 7, not fixed quietly in rustpb.
+
+Parser fixtures, each checked against 0.1.2 with its expected value or
+error: the proto-name alias, an unknown key, `null` for each kind of field,
+a duplicate scalar key, a duplicate repeated key, two oneof members, a
+standalone enum as `{"value": n}` / `"NAME"` / `n` / an unknown name, and
+int64 given as a number versus a string.
+
 ## 6. Proof: how we know the bytes and JSON are the same
 
 ```
@@ -255,9 +369,34 @@ How rustpb-json does it:
 3. **Real data.** A sample of stored records and queue messages is decoded
    by both implementations and the results compared. That proves the
    mappers too, the default-on-bad-id case included.
-4. **Mutations.** Break the derive (swap a tag, drop zigzag, skip an unknown
+4. **Decoding fixtures** (review #1, finding 5). Random values only
+   produce bytes a well-behaved writer emits. A decoder must also handle
+   bytes no ScalaPB writer produces, so these are hand-built byte strings,
+   each decoded by ScalaPB to record its expected value or failure. The
+   right column is what we expect; ScalaPB's recorded result is the
+   authority, and a disagreement is fixed in rustpb:
+
+   | Case | What it proves |
+   |---|---|
+   | A singular scalar field twice | The last one wins |
+   | A singular message field twice | The occurrences merge, as base values before mapping (§4.1) |
+   | A mapped message field twice | It merges as base, then `to_custom` runs once |
+   | A repeated scalar field, packed and unpacked chunks mixed | Both forms accepted, order kept |
+   | Oneof: the same variant twice | The message variant merges; a scalar variant's last wins |
+   | Oneof: two different variants | The last one wins |
+   | Sealed oneof empty in each position | `Empty` / `None` (§4.3) |
+   | A `required` field absent | `DecodeError` naming the field |
+   | A map entry with key or value missing | The default is used for the missing part |
+   | Unknown fields of each wire type, preserved and not | Kept in order, or dropped |
+   | An enum number not in the enum | `Unrecognized(n)` and back |
+   | A mapping failure | `DecodeError::Map` |
+   | Truncated: inside a varint, a length prefix, a fixed64 | `DecodeError`, not a panic |
+   | Invalid: a length past the end, wire type 6 or 7, tag 0, a varint over 10 bytes, a group | `DecodeError`, not a panic |
+   | Invalid UTF-8 in a `string` | `DecodeError`, as ScalaPB's parser rejects it |
+
+5. **Mutations.** Break the derive (swap a tag, drop zigzag, skip an unknown
    field) and require a test to fail.
-5. **rust-js.** The same corpus is run through the JS output, compared
+6. **rust-js.** The same corpus is run through the JS output, compared
    against native rustpb (§7).
 
 ## 7. The rust-js side (separate ADR in rust-js)
@@ -299,3 +438,7 @@ serde, already supported.
 5. Do the 2 `service` declarations need code (gRPC via tonic), or only messages?
 6. Time types: which Rust crate replaces `java.time.Instant`/`LocalDate`
    (`jiff` or `chrono`), and do the mappers live in rustpb or in the app?
+7. scalapb-jsoniter 0.1.2 silently skips proto-name keys (`my_field`).
+   Fix it on both sides together (an alias in the Scala parser and in
+   rustpb, by one decision), or keep matching it? rustpb matches 0.1.2
+   until this is decided.
