@@ -466,8 +466,8 @@ from what Scala reads.
 ### 4.6 Wire policies, and limits
 
 The Rust ecosystem's worst bugs were not in new features. They were small
-policies copied by default, and missing limits. See the prior-art report,
-`reports/Rust protobuf ecosystem prior art.md`. Each rule below is rustpb's
+policies copied by default, and missing limits. See
+[the prior-art report](prior-art/report.md) (notes in `prior-art/notes/`). Each rule below is rustpb's
 own, read from ScalaPB's source where ScalaPB decides it, and pinned by a
 fixture.
 
